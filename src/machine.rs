@@ -130,6 +130,14 @@ impl<'buf> Accumulator<'buf> {
     }
 }
 
+pub trait Flash {
+    fn flash_range(&mut self, _start: u32, _data: &[u8]);
+    fn erase_range(&mut self, _start: u32, _len: u32);
+    fn write_settings(&mut self, _data: &[u8], crc: u32);
+    fn read_range(&mut self, start_addr: u32, len: u32) -> &[u8];
+    fn parameters(&self) -> &Parameters;
+}
+
 const CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_CKSUM);
 
 struct BootLoadMeta {
@@ -151,25 +159,37 @@ fn default_params() -> Parameters {
     Parameters {
         settings_max: (2 * 1024) - 4,
         data_chunk_size: 2 * 1024,
-        valid_ram_range: (0x2000_0000, 0x2000_0000 + (8 * 1024)),
         valid_flash_range: (0x0000_0000, 0x0000_0000 + (64 * 1024)),
         valid_app_range: (0x0000_0000 + (16 * 1024), 0x0000_0000 + (64 * 1024)),
         read_max: 2 * 1024,
     }
 }
 
-pub struct State {
+pub struct State<HW: Flash> {
     pending_resp: Option<Result<Response<'static>, ResponseError>>,
     mode: Mode,
-    params: Parameters,
+    hardware: HW,
 }
 
-pub struct Machine<'buf> {
+pub struct Machine<'buf, HW: Flash> {
     acc: Accumulator<'buf>,
-    state: State,
+    state: State<HW>,
 }
 
-impl<'buf> Machine<'buf> {
+impl<'buf, HW: Flash> Machine<'buf, HW> {
+    pub fn new(buf: &'buf mut [u8], hw: HW) -> Self {
+        let acc = Accumulator::new(buf);
+        let state = State {
+            pending_resp: None,
+            mode: Mode::Idle,
+            hardware: hw,
+        };
+        Self {
+            acc,
+            state,
+        }
+    }
+
     pub fn push<'me>(&'me mut self, byte: u8) -> Option<BorrowBuf<'me, 'buf>> {
         let Machine { acc, state } = self;
 
@@ -188,7 +208,7 @@ impl<'buf> Machine<'buf> {
     }
 }
 
-impl State {
+impl<HW: Flash> State<HW> {
     pub fn handle_msg(&mut self, msg: Request<'_>) {
         self.pending_resp = Some(self.handle_msg_inner(msg));
     }
@@ -197,7 +217,7 @@ impl State {
     fn handle_msg_inner(&mut self, msg: Request<'_>) -> Result<Response<'static>, ResponseError> {
         match msg {
             Request::Ping(n) => Ok(Response::Pong(n)),
-            Request::GetParameters => Ok(Response::Parameters(self.params)),
+            Request::GetParameters => Ok(Response::Parameters(*self.hardware.parameters())),
             Request::StartBootload(sb) => {
                 let response;
                 self.mode = match core::mem::replace(&mut self.mode, Mode::Idle) {
@@ -257,9 +277,9 @@ impl State {
                 crc32: 0x0000_0000,
             }),
             Request::WriteSettings { crc32, data } => {
-                if data.len() as u32 > self.params.settings_max {
+                if data.len() as u32 > self.hardware.parameters().settings_max {
                     return Err(ResponseError::SettingsTooLong {
-                        max: self.params.settings_max,
+                        max: self.hardware.parameters().settings_max,
                         actual: data.len() as u32,
                     });
                 }
@@ -270,7 +290,7 @@ impl State {
                         actual: act_crc,
                     });
                 }
-                self.write_settings(data);
+                self.hardware.write_settings(data, act_crc);
                 Ok(Response::SettingsAccepted {
                     data_len: data.len() as u32,
                     crc32: act_crc,
@@ -300,7 +320,22 @@ impl State {
                     Mode::RebootPending => Status::Idle,
                 }
             })),
-            Request::ReadRange { .. } => todo!(),
+            Request::ReadRange { start_addr, len } => {
+                let start_ok = start_addr >= self.hardware.parameters().valid_flash_range.0;
+                if !start_ok {
+                    return Err(ResponseError::BadRangeStart);
+                }
+
+                if let Some(end) = start_addr.checked_add(len) {
+                    if end <= self.hardware.parameters().valid_flash_range.1 {
+                        Ok(Response::ReadRange { start_addr, len, data: &[] })
+                    } else {
+                        Err(ResponseError::BadRangeEnd)
+                    }
+                } else {
+                    Err(ResponseError::BadRangeEnd)
+                }
+            },
             Request::AbortBootload => {
                 let mode = core::mem::replace(&mut self.mode, Mode::Idle);
                 let response;
@@ -372,10 +407,10 @@ impl State {
                 Mode::BootLoad(meta),
             );
         }
-        if dc.data.len() as u32 != self.params.data_chunk_size {
+        if dc.data.len() as u32 != self.hardware.parameters().data_chunk_size {
             return (
                 Err(ResponseError::IncorrectLength {
-                    expected: self.params.data_chunk_size,
+                    expected: self.hardware.parameters().data_chunk_size,
                     actual: dc.data.len() as u32,
                 }),
                 Mode::BootLoad(meta),
@@ -397,9 +432,9 @@ impl State {
             );
         }
 
-        self.flash_range(dc.data_addr, dc.data);
+        self.hardware.flash_range(dc.data_addr, dc.data);
         meta.digest_running.update(dc.data);
-        meta.addr_current += self.params.data_chunk_size;
+        meta.addr_current += self.hardware.parameters().data_chunk_size;
 
         (
             Ok(Response::ChunkAccepted {
@@ -415,16 +450,16 @@ impl State {
         &mut self,
         sb: StartBootload,
     ) -> (Result<Response<'static>, ResponseError>, Mode) {
-        if sb.start_addr != self.params.valid_app_range.0 {
+        if sb.start_addr != self.hardware.parameters().valid_app_range.0 {
             return (Err(ResponseError::BadStartAddress), Mode::Idle);
         }
-        let too_long = sb.length >= (self.params.valid_app_range.1 - self.params.valid_app_range.0);
-        let not_full = (sb.length & (self.params.data_chunk_size - 1)) != 0;
+        let too_long = sb.length >= (self.hardware.parameters().valid_app_range.1 - self.hardware.parameters().valid_app_range.0);
+        let not_full = (sb.length & (self.hardware.parameters().data_chunk_size - 1)) != 0;
         if too_long || not_full {
             return (Err(ResponseError::BadLength), Mode::Idle);
         }
 
-        self.erase_range(sb.start_addr, sb.length);
+        self.hardware.erase_range(sb.start_addr, sb.length);
 
         (
             Ok(Response::BootloadStarted),
@@ -443,7 +478,10 @@ impl State {
         let _msg = match msg {
             Ok(ok_msg) => Ok(match ok_msg {
                 // These require "re-work"!
-                Response::ReadRange { .. } => todo!(),
+                Response::ReadRange { start_addr, len, data: _  } => {
+                    let read = self.hardware.read_range(start_addr, len);
+                    Response::ReadRange { start_addr, len, data: read }
+                },
                 Response::Settings { .. } => todo!(),
                 other => other,
             }),
@@ -453,18 +491,6 @@ impl State {
         // TODO! Encode and stuff
         buf.shrink_to(0);
         buf
-    }
-
-    fn flash_range(&mut self, _start: u32, _data: &[u8]) {
-        todo!()
-    }
-
-    fn erase_range(&mut self, _start: u32, _len: u32) {
-        todo!()
-    }
-
-    fn write_settings(&mut self, _data: &[u8]) {
-        todo!()
     }
 }
 

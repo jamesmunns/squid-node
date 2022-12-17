@@ -81,7 +81,6 @@ pub enum Status {
 pub struct Parameters {
     pub settings_max: u32,
     pub data_chunk_size: u32,
-    pub valid_ram_range: (u32, u32),
     pub valid_flash_range: (u32, u32),
     pub valid_app_range: (u32, u32),
     pub read_max: u32,
