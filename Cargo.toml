@@ -1,0 +1,25 @@
+[package]
+name = "squid-boot"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[dependencies.cobs]
+version = "0.2.3"
+default-features = false
+
+[dependencies.crc]
+version = "3.0.0"
+default-features = false
+
+[dependencies.postcard]
+version = "1.0.2"
+default-features = false
+
+[dependencies.serde]
+version = "1.0.151"
+default-features = false
+features = ["derive"]
