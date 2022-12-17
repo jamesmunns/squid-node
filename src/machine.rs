@@ -5,6 +5,7 @@ use crc::Digest;
 use crc::CRC_32_CKSUM;
 
 use crate::icd::DataChunk;
+use crate::icd::Parameters;
 use crate::icd::Request;
 use crate::icd::Response;
 use crate::icd::ResponseError;
@@ -145,9 +146,22 @@ enum Mode {
     RebootPending,
 }
 
+fn default_params() -> Parameters {
+    // todo
+    Parameters {
+        settings_max: (2 * 1024) - 4,
+        data_chunk_size: 2 * 1024,
+        valid_ram_range: (0x2000_0000, 0x2000_0000 + (8 * 1024)),
+        valid_flash_range: (0x0000_0000, 0x0000_0000 + (64 * 1024)),
+        valid_app_range: (0x0000_0000 + (16 * 1024), 0x0000_0000 + (64 * 1024)),
+        read_max: 2 * 1024,
+    }
+}
+
 pub struct State {
     pending_resp: Option<Result<Response<'static>, ResponseError>>,
     mode: Mode,
+    params: Parameters,
 }
 
 pub struct Machine<'buf> {
@@ -183,13 +197,7 @@ impl State {
     fn handle_msg_inner(&mut self, msg: Request<'_>) -> Result<Response<'static>, ResponseError> {
         match msg {
             Request::Ping(n) => Ok(Response::Pong(n)),
-            Request::GetParameters => Ok(Response::Parameters {
-                settings_max: 2 * 1024,
-                data_chunk_size: 2 * 1024,
-                valid_ram_read: (0x2000_0000, 0x2000_0000 + (8 * 1024)),
-                valid_flash_read: (0x0000_0000, 0x0000_0000 + (64 * 1024)),
-                read_max: 2 * 1024,
-            }),
+            Request::GetParameters => Ok(Response::Parameters(self.params)),
             Request::StartBootload(sb) => {
                 let response;
                 self.mode = match core::mem::replace(&mut self.mode, Mode::Idle) {
@@ -249,9 +257,9 @@ impl State {
                 crc32: 0x0000_0000,
             }),
             Request::WriteSettings { crc32, data } => {
-                if data.len() > (2 * 1024) {
+                if data.len() as u32 > self.params.settings_max {
                     return Err(ResponseError::SettingsTooLong {
-                        max: 2 * 1024,
+                        max: self.params.settings_max,
                         actual: data.len() as u32,
                     });
                 }
@@ -364,10 +372,10 @@ impl State {
                 Mode::BootLoad(meta),
             );
         }
-        if dc.data.len() != (2 * 1024) {
+        if dc.data.len() as u32 != self.params.data_chunk_size {
             return (
                 Err(ResponseError::IncorrectLength {
-                    expected: 2 * 1024,
+                    expected: self.params.data_chunk_size,
                     actual: dc.data.len() as u32,
                 }),
                 Mode::BootLoad(meta),
@@ -391,7 +399,7 @@ impl State {
 
         self.flash_range(dc.data_addr, dc.data);
         meta.digest_running.update(dc.data);
-        meta.addr_current += 2 * 1024;
+        meta.addr_current += self.params.data_chunk_size;
 
         (
             Ok(Response::ChunkAccepted {
@@ -407,11 +415,11 @@ impl State {
         &mut self,
         sb: StartBootload,
     ) -> (Result<Response<'static>, ResponseError>, Mode) {
-        if sb.start_addr != (0x0000_0000 + 16 * 1024) {
+        if sb.start_addr != self.params.valid_app_range.0 {
             return (Err(ResponseError::BadStartAddress), Mode::Idle);
         }
-        let too_long = sb.length >= ((64 - 16) * 1024);
-        let not_full = (sb.length & (1024 - 1)) != 0;
+        let too_long = sb.length >= (self.params.valid_app_range.1 - self.params.valid_app_range.0);
+        let not_full = (sb.length & (self.params.data_chunk_size - 1)) != 0;
         if too_long || not_full {
             return (Err(ResponseError::BadLength), Mode::Idle);
         }

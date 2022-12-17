@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct DataChunk<'a> {
@@ -18,22 +18,14 @@ pub struct StartBootload {
 pub enum Request<'a> {
     Ping(u32),
     GetParameters,
-// -=-=-=-=-=-=-=- DON'T REORDER ABOVE HERE -=-=-=-=-=-=-=- //
+    // -=-=-=-=-=-=-=- DON'T REORDER ABOVE HERE -=-=-=-=-=-=-=- //
     StartBootload(StartBootload),
     DataChunk(DataChunk<'a>),
-    CompleteBootload {
-        reboot: bool,
-    },
+    CompleteBootload { reboot: bool },
     GetSettings,
-    WriteSettings {
-        crc32: u32,
-        data: &'a [u8],
-    },
+    WriteSettings { crc32: u32, data: &'a [u8] },
     GetStatus,
-    ReadRange {
-        start_addr: u32,
-        len: u32,
-    },
+    ReadRange { start_addr: u32, len: u32 },
     AbortBootload,
 }
 
@@ -45,48 +37,24 @@ pub enum ResponseError {
     BootloadInProgress,
 
     // DataChunk responses
-    SkippedRange {
-        expected: u32,
-        actual: u32,
-    },
-    IncorrectLength {
-        expected: u32,
-        actual: u32,
-    },
-    BadSubCrc {
-        expected: u32,
-        actual: u32,
-    },
+    SkippedRange { expected: u32, actual: u32 },
+    IncorrectLength { expected: u32, actual: u32 },
+    BadSubCrc { expected: u32, actual: u32 },
     NoBootloadActive,
     TooManyChunks,
 
     // CompleteBootload responses
-    IncompleteLoad {
-        expected_len: u32,
-        actual_len: u32,
-    },
-    BadFullCrc {
-        expected: u32,
-        actual: u32,
-    },
+    IncompleteLoad { expected_len: u32, actual_len: u32 },
+    BadFullCrc { expected: u32, actual: u32 },
 
     // WriteSettings
-    SettingsTooLong {
-        max: u32,
-        actual: u32,
-    },
-    BadSettingsCrc {
-        expected: u32,
-        actual: u32,
-    },
+    SettingsTooLong { max: u32, actual: u32 },
+    BadSettingsCrc { expected: u32, actual: u32 },
 
     // ReadRange
     BadRangeStart,
     BadRangeEnd,
-    BadRangeLength {
-        actual: u32,
-        max: u32,
-    },
+    BadRangeLength { actual: u32, max: u32 },
 
     LineNak(crate::machine::Error),
     Oops,
@@ -109,16 +77,20 @@ pub enum Status {
     AwaitingComplete,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Parameters {
+    pub settings_max: u32,
+    pub data_chunk_size: u32,
+    pub valid_ram_range: (u32, u32),
+    pub valid_flash_range: (u32, u32),
+    pub valid_app_range: (u32, u32),
+    pub read_max: u32,
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum Response<'a> {
     Pong(u32),
-    Parameters {
-        settings_max: u32,
-        data_chunk_size: u32,
-        valid_ram_read: (u32, u32),
-        valid_flash_read: (u32, u32),
-        read_max: u32,
-    },
+    Parameters(Parameters),
     // -=-=-=-=-=-=-=- DON'T REORDER ABOVE HERE -=-=-=-=-=-=-=- //
     BootloadStarted,
     ChunkAccepted {
@@ -151,7 +123,6 @@ pub enum Response<'a> {
 
 #[cfg(feature = "use-std")]
 impl<'a> Request<'a> {
-
     /// Encode a request to a vec.
     ///
     /// Does:
@@ -161,7 +132,7 @@ impl<'a> Request<'a> {
     /// * cobs encoding
     /// * DOES append `0x00` terminator
     pub fn encode_to_vec(&self) -> Vec<u8> {
-        use crc::{CRC_32_CKSUM, Crc};
+        use crc::{Crc, CRC_32_CKSUM};
 
         let mut used = postcard::to_stdvec(self).unwrap();
 
