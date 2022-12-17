@@ -1,20 +1,26 @@
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct DataChunk<'a> {
+    pub data_addr: u32,
+    pub sub_crc32: u32,
+    pub data: &'a [u8],
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct StartBootload {
+    pub start_addr: u32,
+    pub length: u32,
+    pub crc32: u32,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum Request<'a> {
     Ping(u32),
     GetParameters,
-    // -=-=-=-=-=-=-=- DON'T REORDER ABOVE HERE -=-=-=-=-=-=-=- //
-    StartBootload {
-        start_addr: u32,
-        length: u32,
-        crc32: u32,
-    },
-    DataChunk {
-        data_addr: u32,
-        sub_crc32: u32,
-        data: &'a [u8],
-    },
+// -=-=-=-=-=-=-=- DON'T REORDER ABOVE HERE -=-=-=-=-=-=-=- //
+    StartBootload(StartBootload),
+    DataChunk(DataChunk<'a>),
     CompleteBootload {
         reboot: bool,
     },

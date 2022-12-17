@@ -1,12 +1,14 @@
 use core::ops::Deref;
 use core::ops::DerefMut;
 use crc::Crc;
-use crc::CRC_32_CKSUM;
 use crc::Digest;
+use crc::CRC_32_CKSUM;
 
+use crate::icd::DataChunk;
 use crate::icd::Request;
 use crate::icd::Response;
 use crate::icd::ResponseError;
+use crate::icd::StartBootload;
 use crate::icd::Status;
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +36,7 @@ impl<'acc, 'buf: 'acc> BorrowBuf<'acc, 'buf> {
         if size < self.acc.buffer.len() {
             // NOTE: Morally equivalent to:
             // self.acc.buffer = &mut self.acc.buffer[..size];
-            let buffer = core::mem::replace(&mut self.acc.buffer, &mut []);
+            let buffer = core::mem::take(&mut self.acc.buffer);
             let (start, _end) = buffer.split_at_mut(size);
             self.acc.buffer = start;
         }
@@ -72,7 +74,7 @@ impl<'buf> Accumulator<'buf> {
         }
     }
 
-    pub fn push<'me>(&'me mut self, byte: u8) -> Result<Option<Request<'me>>, Error> {
+    pub fn push(&mut self, byte: u8) -> Result<Option<Request<'_>>, Error> {
         self.buffer[self.idx] = byte;
         self.idx += 1;
 
@@ -89,7 +91,7 @@ impl<'buf> Accumulator<'buf> {
         }
     }
 
-    fn finish<'me>(&'me mut self) -> Result<Option<Request<'me>>, Error> {
+    fn finish(&mut self) -> Result<Option<Request<'_>>, Error> {
         let data = self.buffer.get_mut(..self.idx).ok_or(Error::LogicError)?;
         self.idx = 0;
 
@@ -116,7 +118,7 @@ impl<'buf> Accumulator<'buf> {
             });
         }
 
-        match postcard::from_bytes::<Request<'me>>(data) {
+        match postcard::from_bytes::<Request<'_>>(data) {
             Ok(req) => Ok(Some(req)),
             Err(_) => Err(Error::PostcardDecode),
         }
@@ -129,15 +131,23 @@ impl<'buf> Accumulator<'buf> {
 
 const CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_CKSUM);
 
+struct BootLoadMeta {
+    digest_running: Digest<'static, u32>,
+    addr_start: u32,
+    addr_current: u32,
+    length: u32,
+    exp_crc: u32,
+}
+
+enum Mode {
+    Idle,
+    BootLoad(BootLoadMeta),
+    RebootPending,
+}
+
 pub struct State {
     pending_resp: Option<Result<Response<'static>, ResponseError>>,
-    bootload_active: bool,
-    reboot_pending: bool,
-    bl_digest_running: Option<Digest<'static, u32>>,
-    bl_addr_start: u32,
-    bl_addr_current: u32,
-    bl_length: u32,
-    bl_exp_crc: u32,
+    mode: Mode,
 }
 
 pub struct Machine<'buf> {
@@ -150,7 +160,7 @@ impl<'buf> Machine<'buf> {
         let Machine { acc, state } = self;
 
         match acc.push(byte) {
-            Ok(None) => return None,
+            Ok(None) => None,
             Ok(Some(msg)) => {
                 state.handle_msg(msg);
                 Some(state.respond(acc.borrow_buf()))
@@ -180,105 +190,64 @@ impl State {
                 valid_flash_read: (0x0000_0000, 0x0000_0000 + (64 * 1024)),
                 read_max: 2 * 1024,
             }),
-            Request::StartBootload {
-                start_addr,
-                length,
-                crc32,
-            } => {
-                if self.bootload_active {
-                    return Err(ResponseError::BootloadInProgress);
-                }
-                if start_addr != (0x0000_0000 + 16 * 1024) {
-                    return Err(ResponseError::BadStartAddress);
-                }
-                let too_long = length >= ((64 - 16) * 1024);
-                let not_full = (length & (1024 - 1)) != 0;
-                if too_long || not_full {
-                    return Err(ResponseError::BadLength);
-                }
-
-                self.bootload_active = true;
-                self.bl_digest_running = Some(CRC.digest());
-                self.bl_addr_start = start_addr;
-                self.bl_addr_current = start_addr;
-                self.bl_length = length;
-                self.bl_exp_crc = crc32;
-
-                self.erase_range(start_addr, length);
-
-                Ok(Response::BootloadStarted)
+            Request::StartBootload(sb) => {
+                let response;
+                self.mode = match core::mem::replace(&mut self.mode, Mode::Idle) {
+                    Mode::Idle => {
+                        let (resp, mode) = self.handle_start(sb);
+                        response = resp;
+                        mode
+                    }
+                    Mode::BootLoad(_) => todo!(),
+                    Mode::RebootPending => {
+                        response = Err(ResponseError::BootloadInProgress);
+                        Mode::RebootPending
+                    }
+                };
+                response
             }
-            Request::DataChunk {
-                data_addr,
-                sub_crc32,
-                data,
-            } => {
-                if !self.bootload_active {
-                    return Err(ResponseError::NoBootloadActive);
-                }
-                if data_addr != self.bl_addr_current {
-                    return Err(ResponseError::SkippedRange {
-                        expected: self.bl_addr_current,
-                        actual: data_addr,
-                    });
-                }
-                if data.len() != (2 * 1024) {
-                    return Err(ResponseError::IncorrectLength {
-                        expected: 2 * 1024,
-                        actual: data.len() as u32,
-                    });
-                }
-                if self.bl_addr_current >= (self.bl_addr_start + self.bl_length) {
-                    return Err(ResponseError::TooManyChunks);
-                }
-
-                let crcr = Crc::<u32>::new(&CRC_32_CKSUM);
-                let calc_crc = crcr.checksum(data);
-                if calc_crc != sub_crc32 {
-                    return Err(ResponseError::BadSubCrc {
-                        expected: sub_crc32,
-                        actual: calc_crc,
-                    });
-                }
-
-                self.flash_range(data_addr, data);
-                match self.bl_digest_running.as_mut() {
-                    Some(bldr) => bldr.update(data),
-                    None => return Err(ResponseError::Oops),
-                }
-                self.bl_addr_current += 2 * 1024;
-
-                Ok(Response::ChunkAccepted {
-                    data_addr,
-                    data_len: data.len() as u32,
-                    crc32: calc_crc,
-                })
+            Request::DataChunk(dc) => {
+                let response;
+                self.mode = match core::mem::replace(&mut self.mode, Mode::Idle) {
+                    Mode::Idle => {
+                        response = Err(ResponseError::NoBootloadActive);
+                        Mode::Idle
+                    }
+                    Mode::BootLoad(meta) => {
+                        let (resp, mode) = self.handle_chunk(meta, dc);
+                        response = resp;
+                        mode
+                    }
+                    Mode::RebootPending => {
+                        response = Err(ResponseError::NoBootloadActive);
+                        Mode::RebootPending
+                    }
+                };
+                response
             }
             Request::CompleteBootload { reboot } => {
-                if !self.bootload_active {
-                    return Err(ResponseError::NoBootloadActive);
-                }
-                let complete = self.bl_addr_current == (self.bl_addr_start + self.bl_length);
-                if !complete {
-                    return Err(ResponseError::IncompleteLoad {
-                        expected_len: self.bl_length,
-                        actual_len: self.bl_addr_current - self.bl_addr_start,
-                    });
-                }
-                let calc_crc = match self.bl_digest_running.take() {
-                    Some(bldr) => bldr.finalize(),
-                    None => return Err(ResponseError::Oops),
+                let response;
+                self.mode = match core::mem::replace(&mut self.mode, Mode::Idle) {
+                    Mode::Idle => {
+                        response = Err(ResponseError::NoBootloadActive);
+                        Mode::Idle
+                    }
+                    Mode::BootLoad(meta) => {
+                        let (resp, mode) = self.handle_complete(meta, reboot);
+                        response = resp;
+                        mode
+                    }
+                    Mode::RebootPending => {
+                        response = Err(ResponseError::NoBootloadActive);
+                        Mode::RebootPending
+                    }
                 };
-                if calc_crc != self.bl_exp_crc {
-                    return Err(ResponseError::BadFullCrc {
-                        expected: self.bl_exp_crc,
-                        actual: calc_crc,
-                    });
-                }
-                self.reboot_pending = reboot;
-                Ok(Response::ConfirmComplete { will_reboot: reboot })
-            },
-            Request::GetSettings => Ok(Response::Settings { data: &[], crc32: 0x0000_0000 }),
+                response
+            }
+            Request::GetSettings => Ok(Response::Settings {
+                data: &[],
+                crc32: 0x0000_0000,
+            }),
             Request::WriteSettings { crc32, data } => {
                 if data.len() > (2 * 1024) {
                     return Err(ResponseError::SettingsTooLong {
@@ -298,49 +267,167 @@ impl State {
                     data_len: data.len() as u32,
                     crc32: act_crc,
                 })
-            },
-            Request::GetStatus => {
-                Ok(Response::Status({
-                    if !self.bootload_active {
-                        Status::Idle
-                    } else if self.bl_addr_start == self.bl_addr_current {
-                        Status::Started {
-                            start_addr: self.bl_addr_start,
-                            length: self.bl_length,
-                            crc32: self.bl_exp_crc,
-                        }
-                    } else if self.bl_addr_current == (self.bl_addr_start + self.bl_length) {
-                        Status::AwaitingComplete
-                    } else {
-                        if let Some(digest) = self.bl_digest_running.as_ref() {
-                            Status::Loading {
-                                start_addr: self.bl_addr_start,
-                                next_addr: self.bl_addr_current,
-                                partial_crc32: digest.clone().finalize(),
-                                expected_crc32: self.bl_exp_crc,
+            }
+            Request::GetStatus => Ok(Response::Status({
+                match &self.mode {
+                    Mode::Idle => Status::Idle,
+                    Mode::BootLoad(meta) => {
+                        if meta.addr_start == meta.addr_current {
+                            Status::Started {
+                                start_addr: meta.addr_start,
+                                length: meta.length,
+                                crc32: meta.exp_crc,
                             }
+                        } else if meta.addr_current == (meta.addr_start + meta.length) {
+                            Status::AwaitingComplete
                         } else {
-                            return Err(ResponseError::Oops);
+                            Status::Loading {
+                                start_addr: meta.addr_start,
+                                next_addr: meta.addr_current,
+                                partial_crc32: meta.digest_running.clone().finalize(),
+                                expected_crc32: meta.exp_crc,
+                            }
                         }
                     }
-                }))
-            },
+                    Mode::RebootPending => Status::Idle,
+                }
+            })),
             Request::ReadRange { .. } => todo!(),
             Request::AbortBootload => {
-                if self.bootload_active {
-                    self.bootload_active = false;
-                    self.reboot_pending = false;
-                    self.bl_digest_running = None;
-                    self.bl_addr_start = 0;
-                    self.bl_addr_current = 0;
-                    self.bl_length = 0;
-                    self.bl_exp_crc = 0;
-                    Ok(Response::BootloadAborted)
-                } else {
-                    Err(ResponseError::NoBootloadActive)
-                }
-            },
+                let mode = core::mem::replace(&mut self.mode, Mode::Idle);
+                let response;
+                self.mode = match mode {
+                    Mode::Idle => {
+                        response = Err(ResponseError::NoBootloadActive);
+                        Mode::Idle
+                    }
+                    Mode::BootLoad(_meta) => {
+                        response = Ok(Response::BootloadAborted);
+                        Mode::Idle
+                    }
+                    Mode::RebootPending => {
+                        response = Err(ResponseError::NoBootloadActive);
+                        Mode::RebootPending
+                    }
+                };
+                response
+            }
         }
+    }
+
+    fn handle_complete(
+        &mut self,
+        meta: BootLoadMeta,
+        reboot: bool,
+    ) -> (Result<Response<'static>, ResponseError>, Mode) {
+        let complete = meta.addr_current == (meta.addr_start + meta.length);
+        let response;
+        let mode = if !complete {
+            response = Err(ResponseError::IncompleteLoad {
+                expected_len: meta.length,
+                actual_len: meta.addr_current - meta.addr_start,
+            });
+            Mode::BootLoad(meta)
+        } else {
+            let calc_crc = meta.digest_running.finalize();
+            if calc_crc != meta.exp_crc {
+                response = Err(ResponseError::BadFullCrc {
+                    expected: meta.exp_crc,
+                    actual: calc_crc,
+                });
+                Mode::Idle
+            } else {
+                response = Ok(Response::ConfirmComplete {
+                    will_reboot: reboot,
+                });
+                if reboot {
+                    Mode::RebootPending
+                } else {
+                    Mode::Idle
+                }
+            }
+        };
+        (response, mode)
+    }
+
+    fn handle_chunk(
+        &mut self,
+        mut meta: BootLoadMeta,
+        dc: DataChunk<'_>,
+    ) -> (Result<Response<'static>, ResponseError>, Mode) {
+        if dc.data_addr != meta.addr_current {
+            return (
+                Err(ResponseError::SkippedRange {
+                    expected: meta.addr_current,
+                    actual: dc.data_addr,
+                }),
+                Mode::BootLoad(meta),
+            );
+        }
+        if dc.data.len() != (2 * 1024) {
+            return (
+                Err(ResponseError::IncorrectLength {
+                    expected: 2 * 1024,
+                    actual: dc.data.len() as u32,
+                }),
+                Mode::BootLoad(meta),
+            );
+        }
+        if meta.addr_current >= (meta.addr_start + meta.length) {
+            return (Err(ResponseError::TooManyChunks), Mode::BootLoad(meta));
+        }
+
+        let crcr = Crc::<u32>::new(&CRC_32_CKSUM);
+        let calc_crc = crcr.checksum(dc.data);
+        if calc_crc != dc.sub_crc32 {
+            return (
+                Err(ResponseError::BadSubCrc {
+                    expected: dc.sub_crc32,
+                    actual: calc_crc,
+                }),
+                Mode::BootLoad(meta),
+            );
+        }
+
+        self.flash_range(dc.data_addr, dc.data);
+        meta.digest_running.update(dc.data);
+        meta.addr_current += 2 * 1024;
+
+        (
+            Ok(Response::ChunkAccepted {
+                data_addr: dc.data_addr,
+                data_len: dc.data.len() as u32,
+                crc32: calc_crc,
+            }),
+            Mode::BootLoad(meta),
+        )
+    }
+
+    fn handle_start(
+        &mut self,
+        sb: StartBootload,
+    ) -> (Result<Response<'static>, ResponseError>, Mode) {
+        if sb.start_addr != (0x0000_0000 + 16 * 1024) {
+            return (Err(ResponseError::BadStartAddress), Mode::Idle);
+        }
+        let too_long = sb.length >= ((64 - 16) * 1024);
+        let not_full = (sb.length & (1024 - 1)) != 0;
+        if too_long || not_full {
+            return (Err(ResponseError::BadLength), Mode::Idle);
+        }
+
+        self.erase_range(sb.start_addr, sb.length);
+
+        (
+            Ok(Response::BootloadStarted),
+            Mode::BootLoad(BootLoadMeta {
+                digest_running: CRC.digest(),
+                addr_start: sb.start_addr,
+                addr_current: sb.start_addr,
+                length: sb.length,
+                exp_crc: sb.crc32,
+            }),
+        )
     }
 
     pub fn respond<'a, 'b>(&mut self, mut buf: BorrowBuf<'a, 'b>) -> BorrowBuf<'a, 'b> {
