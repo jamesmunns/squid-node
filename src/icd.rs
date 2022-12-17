@@ -28,6 +28,7 @@ pub enum Request<'a> {
         start_addr: u32,
         len: u32,
     },
+    AbortBootload,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -35,6 +36,7 @@ pub enum ResponseError {
     // StartBootload responses
     BadStartAddress,
     BadLength,
+    BootloadInProgress,
 
     // DataChunk responses
     SkippedRange {
@@ -49,6 +51,8 @@ pub enum ResponseError {
         expected: u32,
         actual: u32,
     },
+    NoBootloadActive,
+    TooManyChunks,
 
     // CompleteBootload responses
     IncompleteLoad {
@@ -76,7 +80,10 @@ pub enum ResponseError {
     BadRangeLength {
         actual: u32,
         max: u32,
-    }
+    },
+
+    LineNak(crate::machine::Error),
+    Oops,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -125,7 +132,40 @@ pub enum Response<'a> {
         crc32: u32,
     },
     Status(Status),
+    ReadRange {
+        start_addr: u32,
+        len: u32,
+        data: &'a [u8],
+    },
     BadOverfillNak,
     BadPostcardNak,
     BadCrcNak,
+    BootloadAborted,
+}
+
+#[cfg(feature = "use-std")]
+impl<'a> Request<'a> {
+
+    /// Encode a request to a vec.
+    ///
+    /// Does:
+    ///
+    /// * postcard encoding
+    /// * appending crc32 (le)
+    /// * cobs encoding
+    /// * DOES append `0x00` terminator
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        use crc::{CRC_32_CKSUM, Crc};
+
+        let mut used = postcard::to_stdvec(self).unwrap();
+
+        let crcr = Crc::<u32>::new(&CRC_32_CKSUM);
+        let act_crc = crcr.checksum(&used);
+        used.extend_from_slice(&act_crc.to_le_bytes());
+        let mut enc_used = cobs::encode_vec(&used);
+        // Terminator
+        enc_used.push(0x00);
+
+        enc_used
+    }
 }

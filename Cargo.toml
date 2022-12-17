@@ -23,3 +23,13 @@ default-features = false
 version = "1.0.151"
 default-features = false
 features = ["derive"]
+
+[features]
+# default = []
+default = ["use-std"]
+
+use-std = [
+    "cobs/use_std",
+    "serde/std",
+    "postcard/use-std",
+]
