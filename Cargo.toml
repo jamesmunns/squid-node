@@ -25,8 +25,8 @@ default-features = false
 features = ["derive"]
 
 [features]
-# default = []
-default = ["use-std"]
+default = []
+# default = ["use-std"]
 
 use-std = [
     "cobs/use_std",

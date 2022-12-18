@@ -1,18 +1,12 @@
-use core::ops::Deref;
-use core::ops::DerefMut;
-use crc::Crc;
-use crc::Digest;
-use crc::CRC_32_CKSUM;
+use core::ops::{Deref, DerefMut};
 
-use crate::icd::encode_resp_to_slice;
-use crate::icd::DataChunk;
-use crate::icd::Parameters;
-use crate::icd::Request;
-use crate::icd::Response;
-use crate::icd::ResponseError;
-use crate::icd::StartBootload;
-use crate::icd::Status;
 use crate::CRC;
+
+use crate::icd::{
+    encode_resp_to_slice, DataChunk, Parameters, Request, Response, ResponseError, StartBootload,
+    Status, BootCommand,
+};
+use crc::Digest;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -105,12 +99,93 @@ impl<'buf> Accumulator<'buf> {
     }
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub enum Bootable {
+    Unsure,
+    NoMagicFound,
+    NoBadCrc,
+    Yes,
+}
+
 pub trait Flash {
-    fn flash_range(&mut self, _start: u32, _data: &[u8]);
-    fn erase_range(&mut self, _start: u32, _len: u32);
-    fn write_settings(&mut self, _data: &[u8], crc: u32);
+    fn flash_range(&mut self, start: u32, data: &[u8]);
+    fn erase_range(&mut self, start: u32, len: u32);
+    fn write_settings(&mut self, data: &[u8], crc: u32);
     fn read_range(&mut self, start_addr: u32, len: u32) -> &[u8];
     fn parameters(&self) -> &Parameters;
+    fn boot(&mut self) -> !;
+
+    fn is_bootable(&mut self) -> Bootable {
+        let params = self.parameters();
+        let (start, end) = params.valid_app_range;
+        let chunk_len = params.data_chunk_size;
+
+        let read_too_small = params.read_max < params.data_chunk_size;
+        let not_one_page = end < (start.saturating_add(chunk_len));
+        let page_too_small = chunk_len < 8;
+        let backwards = end <= start;
+        let fail_check = read_too_small || not_one_page || page_too_small || backwards;
+
+        if fail_check {
+            debug_assert!(false, "TODO: BYO is_bootable!");
+            return Bootable::Unsure;
+        }
+
+        let magic = {
+            let mut a_bytes = [0u8; 4];
+            let mut b_bytes = [0u8; 4];
+            let first_page = self.read_range(start, 8);
+            a_bytes.copy_from_slice(&first_page[..4]);
+            b_bytes.copy_from_slice(&first_page[4..8]);
+            let a_word = u32::from_le_bytes(a_bytes);
+            let b_word = u32::from_le_bytes(b_bytes);
+            a_word.wrapping_mul(b_word)
+        };
+
+        // Do a first attempt, to attempt to find the magic number
+        // at the end of a page
+        let mut current = start;
+        let mut magic_loc = None;
+        while current < end {
+            let cur_page = self.read_range(current, chunk_len);
+            let mut magic_bytes = [0u8; 4];
+            // Magic should be the SECOND TO LAST WORD in the range
+            magic_bytes.copy_from_slice(&cur_page[(chunk_len - 8) as usize..(chunk_len - 4) as usize]);
+            let magic_word = u32::from_le_bytes(magic_bytes);
+            if magic_word == magic {
+                magic_loc = Some(current);
+                break;
+            }
+            current += chunk_len;
+        }
+
+        let last_page_start = match magic_loc {
+            Some(lps) => lps,
+            None => return Bootable::NoMagicFound,
+        };
+
+        // Okay, now go through, and checksum EVERYTHING
+        let mut digest = CRC.digest();
+        let mut current = start;
+        while current < last_page_start {
+            let cur_page = self.read_range(current, chunk_len);
+            digest.update(cur_page);
+            current += chunk_len;
+        }
+        let last_page = self.read_range(last_page_start, chunk_len);
+        digest.update(&last_page[..(chunk_len - 4) as usize]);
+        let act_crc = digest.finalize();
+        let mut crc_bytes = [0u8; 4];
+        crc_bytes.copy_from_slice(&last_page[(chunk_len - 4) as usize..]);
+        let exp_crc = u32::from_le_bytes(crc_bytes);
+
+        if act_crc == exp_crc {
+            Bootable::Yes
+        } else {
+            Bootable::NoBadCrc
+        }
+    }
+
 }
 
 struct BootLoadMeta {
@@ -124,7 +199,7 @@ struct BootLoadMeta {
 enum Mode {
     Idle,
     BootLoad(BootLoadMeta),
-    RebootPending,
+    BootPending,
 }
 
 fn stm32g031_params() -> Parameters {
@@ -159,6 +234,7 @@ impl<'buf, HW: Flash> Machine<'buf, HW> {
         Self { acc, state }
     }
 
+    #[inline]
     pub fn push<'me>(&'me mut self, byte: u8) -> Option<BorrowBuf<'me, 'buf>> {
         let Machine { acc, state } = self;
 
@@ -182,9 +258,16 @@ impl<'buf, HW: Flash> Machine<'buf, HW> {
             }
         }
     }
+
+    pub fn check_after_send(&mut self) {
+        if matches!(self.state.mode, Mode::BootPending) {
+            self.state.hardware.boot();
+        }
+    }
 }
 
 impl<HW: Flash> State<HW> {
+    #[inline]
     pub fn handle_msg(&mut self, msg: Request<'_>) {
         self.pending_resp = Some(self.handle_msg_inner(msg));
     }
@@ -202,10 +285,13 @@ impl<HW: Flash> State<HW> {
                         response = resp;
                         mode
                     }
-                    Mode::BootLoad(_) => todo!(),
-                    Mode::RebootPending => {
+                    Mode::BootLoad(meta) => {
                         response = Err(ResponseError::BootloadInProgress);
-                        Mode::RebootPending
+                        Mode::BootLoad(meta)
+                    }
+                    Mode::BootPending => {
+                        response = Err(ResponseError::Oops);
+                        Mode::BootPending
                     }
                 };
                 response
@@ -222,14 +308,14 @@ impl<HW: Flash> State<HW> {
                         response = resp;
                         mode
                     }
-                    Mode::RebootPending => {
+                    Mode::BootPending => {
                         response = Err(ResponseError::NoBootloadActive);
-                        Mode::RebootPending
+                        Mode::BootPending
                     }
                 };
                 response
             }
-            Request::CompleteBootload { reboot } => {
+            Request::CompleteBootload { boot } => {
                 let response;
                 self.mode = match core::mem::replace(&mut self.mode, Mode::Idle) {
                     Mode::Idle => {
@@ -237,13 +323,13 @@ impl<HW: Flash> State<HW> {
                         Mode::Idle
                     }
                     Mode::BootLoad(meta) => {
-                        let (resp, mode) = self.handle_complete(meta, reboot);
+                        let (resp, mode) = self.handle_complete(meta, boot);
                         response = resp;
                         mode
                     }
-                    Mode::RebootPending => {
+                    Mode::BootPending => {
                         response = Err(ResponseError::NoBootloadActive);
-                        Mode::RebootPending
+                        Mode::BootPending
                     }
                 };
                 response
@@ -293,7 +379,7 @@ impl<HW: Flash> State<HW> {
                             }
                         }
                     }
-                    Mode::RebootPending => Status::Idle,
+                    Mode::BootPending => Status::Idle,
                 }
             })),
             Request::ReadRange { start_addr, len } => {
@@ -328,20 +414,35 @@ impl<HW: Flash> State<HW> {
                         response = Ok(Response::BootloadAborted);
                         Mode::Idle
                     }
-                    Mode::RebootPending => {
+                    Mode::BootPending => {
                         response = Err(ResponseError::NoBootloadActive);
-                        Mode::RebootPending
+                        Mode::BootPending
                     }
                 };
                 response
             }
+            Request::IsBootable => {
+                Ok(Response::BootableStatus(self.hardware.is_bootable()))
+            },
+            Request::Boot(cmd) => {
+                let boot_status = self.hardware.is_bootable();
+                let will_boot = match cmd {
+                    BootCommand::BootIfBootable => boot_status == Bootable::Yes,
+                    BootCommand::ForceBoot => true,
+                };
+                self.mode = Mode::BootPending;
+                Ok(Response::ConfirmBootCmd {
+                    will_boot,
+                    boot_status,
+                })
+            },
         }
     }
 
     fn handle_complete(
         &mut self,
         meta: BootLoadMeta,
-        reboot: bool,
+        boot_cmd: Option<BootCommand>,
     ) -> (Result<Response<'static>, ResponseError>, Mode) {
         let complete = meta.addr_current == (meta.addr_start + meta.length);
         let response;
@@ -360,11 +461,21 @@ impl<HW: Flash> State<HW> {
                 });
                 Mode::Idle
             } else {
+                let boot_status = self.hardware.is_bootable();
+
+                let will_boot = match boot_cmd {
+                    Some(BootCommand::ForceBoot) => true,
+                    Some(BootCommand::BootIfBootable) => boot_status == Bootable::Yes,
+                    None => false,
+                };
+
                 response = Ok(Response::ConfirmComplete {
-                    will_reboot: reboot,
+                    will_boot,
+                    boot_status,
                 });
-                if reboot {
-                    Mode::RebootPending
+
+                if will_boot {
+                    Mode::BootPending
                 } else {
                     Mode::Idle
                 }
@@ -400,8 +511,7 @@ impl<HW: Flash> State<HW> {
             return (Err(ResponseError::TooManyChunks), Mode::BootLoad(meta));
         }
 
-        let crcr = Crc::<u32>::new(&CRC_32_CKSUM);
-        let calc_crc = crcr.checksum(dc.data);
+        let calc_crc = CRC.checksum(dc.data);
         if calc_crc != dc.sub_crc32 {
             return (
                 Err(ResponseError::BadSubCrc {
@@ -456,6 +566,7 @@ impl<HW: Flash> State<HW> {
         )
     }
 
+    #[inline]
     pub fn respond<'a, 'b>(&mut self, mut buf: BorrowBuf<'a, 'b>) -> BorrowBuf<'a, 'b> {
         let msg = self.pending_resp.take().unwrap_or(Err(ResponseError::Oops));
         let msg = match msg {
@@ -516,7 +627,7 @@ pub mod test {
         icd::{
             decode_in_place, DataChunk, Parameters, Request, Response, ResponseError, StartBootload,
         },
-        machine::{stm32g031_params, Accumulator, Machine, Mode},
+        machine::{stm32g031_params, Accumulator, Machine, Mode, Bootable}, CRC,
     };
     use std::sync::{Arc, Mutex};
 
@@ -603,11 +714,12 @@ pub mod test {
             assert_eq!(self.parameters.valid_flash_range.0, 0);
             let mut inner = self.inner.lock().unwrap();
             let su = start as usize;
-            inner
-                .flash
-                .get_mut(su..su + data.len())
-                .unwrap()
-                .copy_from_slice(data)
+            let range = inner.flash.get_mut(su..su + data.len()).unwrap();
+
+            range
+                .iter()
+                .for_each(|b| assert_eq!(*b, 0xFF, "flash not erased!"));
+            range.copy_from_slice(data)
         }
 
         fn erase_range(&mut self, start: u32, len: u32) {
@@ -637,32 +749,62 @@ pub mod test {
                 .copy_from_slice(&crc.to_le_bytes());
         }
 
-        fn read_range(&mut self, _start_addr: u32, _len: u32) -> &[u8] {
+        fn read_range(&mut self, start: u32, len: u32) -> &[u8] {
             assert_eq!(self.parameters.valid_flash_range.0, 0);
-            todo!("uhhhhh")
+            let mut inner = self.inner.lock().unwrap();
+            let su = start as usize;
+            let lu = len as usize;
+            let vec = inner
+                .flash
+                .get(su..su + lu)
+                .unwrap()
+                .to_vec();
+
+            // This is: uh, not great.
+            vec.leak()
         }
 
         fn parameters(&self) -> &Parameters {
             &self.parameters
         }
+
+        fn boot(&mut self) -> ! {
+            todo!()
+        }
     }
 
     #[test]
     fn do_a_bootload() {
-        let mut acc_buf = [0u8; 3 * 1024];
+        // Create a fake (in-memory) hardware impl
         let hw = AtomicHardware::new(stm32g031_params());
+
+        // Create the bootload "server": this usually runs on-device
+        let mut acc_buf = [0u8; 3 * 1024];
         let mut machine = Machine::new(&mut acc_buf, hw.clone());
 
+        let last = {
+            let mut last = vec![22; 2040];
+            let magic = 0x10101010u32.wrapping_mul(0x10101010u32);
+            last.extend_from_slice(&magic.to_le_bytes());
+            last.extend_from_slice(&0x4F54_CCBCu32.to_le_bytes());
+            last.leak()
+        };
+
+        // The sequence of commands sent and expected responses
         let seq: &[(Request<'static>, Result<Response<'static>, ResponseError>)] = &[
             (
                 Request::GetParameters,
                 Ok(Response::Parameters(stm32g031_params())),
             ),
             (
+                Request::IsBootable,
+                Ok(Response::BootableStatus(Bootable::NoMagicFound))
+            ),
+            (
                 Request::StartBootload(StartBootload {
                     start_addr: 16 * 1024,
                     length: 8 * 1024,
-                    crc32: 0x2765_005a,
+                    crc32: 0x51f3_6231,
                 }),
                 Ok(Response::BootloadStarted),
             ),
@@ -705,51 +847,63 @@ pub mod test {
             (
                 Request::DataChunk(DataChunk {
                     data_addr: 22 * 1024,
-                    sub_crc32: 0x27db_3023,
-                    data: &[22; 2048],
+                    sub_crc32: 0x514d5248,
+                    data: last,
                 }),
                 Ok(Response::ChunkAccepted {
                     data_addr: 22 * 1024,
                     data_len: 2048,
-                    crc32: 0x27db_3023,
+                    crc32: 0x514d5248,
                 }),
             ),
             (
-                Request::CompleteBootload { reboot: true },
-                Ok(Response::ConfirmComplete { will_reboot: true }),
+                Request::CompleteBootload { boot: None },
+                Ok(Response::ConfirmComplete { will_boot: false, boot_status: Bootable::Yes }),
             ),
         ];
 
         for (req, exp_res) in seq {
+            // Encode the message to a vec, but throw away the last byte
+            // so we can trigger that manually
             let mut enc_used = req.encode_to_vec();
-
             enc_used.pop();
+
+            // Push all, make sure no response, then push the final one
             for b in enc_used {
                 let res = machine.push(b);
                 assert!(matches!(res, None));
             }
             let res = machine.push(0x00);
+
+            // Did we get a response, and is it the expected response?
             let mut res = res.unwrap();
             let act_res: Result<Response<'_>, ResponseError> = decode_in_place(&mut res).unwrap();
             assert_eq!(&act_res, exp_res);
+
+            // Does the accumulator reset?
             drop(act_res);
             drop(res);
             assert_eq!(machine.acc.idx, 0);
         }
 
+        // Memory test!
         {
             let hwinner = hw.inner.lock().unwrap();
             let flash = &hwinner.flash;
 
-            // Memory test!
+            // Unprogrammed regions
             assert_eq!(&flash[..16 * 1024], [0xA5; 16 * 1024].as_slice());
-            assert_eq!(&flash[16 * 1024..][.. 2048], [16; 2048].as_slice());
-            assert_eq!(&flash[18 * 1024..][.. 2048], [18; 2048].as_slice());
-            assert_eq!(&flash[20 * 1024..][.. 2048], [20; 2048].as_slice());
-            assert_eq!(&flash[22 * 1024..][.. 2048], [22; 2048].as_slice());
-            assert_eq!(&flash[24 * 1024..][.. (64 - 24) * 1024], [0xA5; (64 - 24) * 1024].as_slice());
+            assert_eq!(&flash[24 * 1024..], [0xA5; (64 - 24) * 1024].as_slice());
+
+            // Programmed regions
+            assert_eq!(&flash[16 * 1024..][..2048], [16; 2048].as_slice());
+            assert_eq!(&flash[18 * 1024..][..2048], [18; 2048].as_slice());
+            assert_eq!(&flash[20 * 1024..][..2048], [20; 2048].as_slice());
+            assert_eq!(&flash[22 * 1024..][..2048], last);
         }
 
-        assert!(matches!(machine.state.mode, Mode::RebootPending));
+        // We commanded NO reboot after flashing
+        assert!(matches!(machine.state.mode, Mode::Idle));
     }
+
 }

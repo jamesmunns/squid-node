@@ -1,8 +1,8 @@
-use crc::Digest;
-use postcard::ser_flavors::{Cobs, Slice, StdVec};
-use serde::{Deserialize, Serialize};
+use crate::{CRC, machine::Bootable};
 
-use crate::CRC;
+use crc::Digest;
+use postcard::ser_flavors::{Cobs, Slice};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct DataChunk<'a> {
@@ -19,18 +19,28 @@ pub struct StartBootload {
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub enum BootCommand {
+    BootIfBootable,
+    ForceBoot,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum Request<'a> {
     Ping(u32),
     GetParameters,
     // -=-=-=-=-=-=-=- DON'T REORDER ABOVE HERE -=-=-=-=-=-=-=- //
     StartBootload(StartBootload),
     DataChunk(DataChunk<'a>),
-    CompleteBootload { reboot: bool },
+    CompleteBootload {
+        boot: Option<BootCommand>,
+    },
     GetSettings,
     WriteSettings { crc32: u32, data: &'a [u8] },
     GetStatus,
     ReadRange { start_addr: u32, len: u32 },
     AbortBootload,
+    IsBootable,
+    Boot(BootCommand),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -81,7 +91,7 @@ pub enum Status {
     AwaitingComplete,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Parameters {
     pub settings_max: u32,
     pub data_chunk_size: u32,
@@ -102,7 +112,8 @@ pub enum Response<'a> {
         crc32: u32,
     },
     ConfirmComplete {
-        will_reboot: bool,
+        will_boot: bool,
+        boot_status: Bootable,
     },
     Settings {
         data: &'a [u8],
@@ -122,6 +133,11 @@ pub enum Response<'a> {
     BadPostcardNak,
     BadCrcNak,
     BootloadAborted,
+    BootableStatus(Bootable),
+    ConfirmBootCmd {
+        will_boot: bool,
+        boot_status: Bootable,
+    }
 }
 
 #[cfg(feature = "use-std")]
@@ -135,6 +151,7 @@ impl<'a> Request<'a> {
     /// * cobs encoding
     /// * DOES append `0x00` terminator
     pub fn encode_to_vec(&self) -> Vec<u8> {
+        use postcard::ser_flavors::StdVec;
         postcard::serialize_with_flavor::<Self, Crc32SerFlavor<Cobs<StdVec>>, Vec<u8>>(
             self,
             Crc32SerFlavor {
@@ -157,6 +174,7 @@ impl<'a> Response<'a> {
     /// * cobs encoding
     /// * DOES append `0x00` terminator
     pub fn encode_to_vec(&self) -> Vec<u8> {
+        use postcard::ser_flavors::StdVec;
         postcard::serialize_with_flavor::<Self, Crc32SerFlavor<Cobs<StdVec>>, Vec<u8>>(
             self,
             Crc32SerFlavor {
@@ -168,6 +186,7 @@ impl<'a> Response<'a> {
     }
 }
 
+#[inline]
 pub fn encode_resp_to_slice<'a, 'b>(
     resp: &Result<Response<'a>, ResponseError>,
     buf: &'b mut [u8],
