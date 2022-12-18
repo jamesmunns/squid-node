@@ -4,6 +4,7 @@ use crc::Crc;
 use crc::Digest;
 use crc::CRC_32_CKSUM;
 
+use crate::icd::encode_resp_to_slice;
 use crate::icd::DataChunk;
 use crate::icd::Parameters;
 use crate::icd::Request;
@@ -31,16 +32,13 @@ pub struct Accumulator<'buf> {
 
 pub struct BorrowBuf<'acc, 'buf: 'acc> {
     acc: &'acc mut Accumulator<'buf>,
+    len: usize,
 }
 
 impl<'acc, 'buf: 'acc> BorrowBuf<'acc, 'buf> {
     pub fn shrink_to(&mut self, size: usize) {
-        if size < self.acc.buffer.len() {
-            // NOTE: Morally equivalent to:
-            // self.acc.buffer = &mut self.acc.buffer[..size];
-            let buffer = core::mem::take(&mut self.acc.buffer);
-            let (start, _end) = buffer.split_at_mut(size);
-            self.acc.buffer = start;
+        if size < self.len {
+            self.len = size;
         }
     }
 }
@@ -56,14 +54,14 @@ impl<'acc, 'buf: 'acc> Deref for BorrowBuf<'acc, 'buf> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        self.acc.buffer
+        &self.acc.buffer[..self.len]
     }
 }
 
 impl<'acc, 'buf: 'acc> DerefMut for BorrowBuf<'acc, 'buf> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.acc.buffer
+        &mut self.acc.buffer[..self.len]
     }
 }
 
@@ -100,7 +98,10 @@ impl<'buf> Accumulator<'buf> {
     }
 
     pub fn borrow_buf<'me>(&'me mut self) -> BorrowBuf<'me, 'buf> {
-        BorrowBuf { acc: self }
+        BorrowBuf {
+            len: self.buffer.len(),
+            acc: self,
+        }
     }
 }
 
@@ -167,10 +168,17 @@ impl<'buf, HW: Flash> Machine<'buf, HW> {
                 state.handle_msg(msg);
                 Some(state.respond(acc.borrow_buf()))
             }
-            Err(_e) => {
-                // TODO: Encode this:
-                // return Some(Err(ResponseError::LineNak(e)))
-                None
+            Err(e) => {
+                let mut buf = acc.borrow_buf();
+
+                match encode_resp_to_slice(&Err(ResponseError::LineNak(e)), &mut buf) {
+                    Ok(resp) => {
+                        let len = resp.len();
+                        buf.shrink_to(len);
+                        Some(buf)
+                    }
+                    Err(_e) => None,
+                }
             }
         }
     }
@@ -425,10 +433,11 @@ impl<HW: Flash> State<HW> {
         if sb.start_addr != self.hardware.parameters().valid_app_range.0 {
             return (Err(ResponseError::BadStartAddress), Mode::Idle);
         }
-        let too_long = sb.length
-            >= (self.hardware.parameters().valid_app_range.1
-                - self.hardware.parameters().valid_app_range.0);
-        let not_full = (sb.length & (self.hardware.parameters().data_chunk_size - 1)) != 0;
+        let max_app_len = self.hardware.parameters().valid_app_range.1
+            - self.hardware.parameters().valid_app_range.0;
+        let too_long = sb.length > max_app_len;
+        let mask = self.hardware.parameters().data_chunk_size - 1;
+        let not_full = (sb.length & mask) != 0;
         if too_long || not_full {
             return (Err(ResponseError::BadLength), Mode::Idle);
         }
@@ -503,12 +512,13 @@ pub mod feat_test {
 
 #[cfg(all(test, feature = "use-std"))]
 pub mod test {
-    use core::sync::atomic::{AtomicU32, Ordering};
-
     use crate::{
-        icd::{Parameters, Request, Response, ResponseError},
-        machine::{stm32g031_params, Accumulator, Machine},
+        icd::{
+            decode_in_place, DataChunk, Parameters, Request, Response, ResponseError, StartBootload,
+        },
+        machine::{stm32g031_params, Accumulator, Machine, Mode},
     };
+    use std::sync::{Arc, Mutex};
 
     use super::Flash;
 
@@ -547,11 +557,7 @@ pub mod test {
         enc_used.pop();
 
         let mut acc_buf = [0u8; 128];
-        let hw_inner = HwInner::default();
-        let hw = AtomicHardware {
-            inner: &hw_inner,
-            parameters: stm32g031_params(),
-        };
+        let hw = AtomicHardware::new(stm32g031_params());
 
         let mut machine = Machine::new(&mut acc_buf, hw);
 
@@ -569,66 +575,181 @@ pub mod test {
     }
 
     struct HwInner {
-        last_flash_start: AtomicU32,
-        last_flash_len: AtomicU32,
-        last_erase_start: AtomicU32,
-        last_erase_len: AtomicU32,
-        last_settings_len: AtomicU32,
-        last_settings_crc32: AtomicU32,
-        last_read_start: AtomicU32,
-        last_read_len: AtomicU32,
+        flash: Vec<u8>,
+        settings: Vec<u8>,
     }
 
-    impl Default for HwInner {
-        fn default() -> Self {
+    #[derive(Clone)]
+    struct AtomicHardware {
+        inner: Arc<Mutex<HwInner>>,
+        parameters: Parameters,
+    }
+
+    impl AtomicHardware {
+        pub fn new(params: Parameters) -> Self {
+            assert_eq!(params.valid_flash_range.0, 0);
             Self {
-                last_flash_start: AtomicU32::new(0xFFFF_FFFF),
-                last_flash_len: AtomicU32::new(0xFFFF_FFFF),
-                last_erase_start: AtomicU32::new(0xFFFF_FFFF),
-                last_erase_len: AtomicU32::new(0xFFFF_FFFF),
-                last_settings_len: AtomicU32::new(0xFFFF_FFFF),
-                last_settings_crc32: AtomicU32::new(0xFFFF_FFFF),
-                last_read_start: AtomicU32::new(0xFFFF_FFFF),
-                last_read_len: AtomicU32::new(0xFFFF_FFFF),
+                inner: Arc::new(Mutex::new(HwInner {
+                    flash: vec![0xA5u8; params.valid_flash_range.1 as usize],
+                    settings: vec![0xCCu8; 4usize + params.settings_max as usize],
+                })),
+                parameters: params,
             }
         }
     }
 
-    struct AtomicHardware<'a> {
-        inner: &'a HwInner,
-        parameters: Parameters,
-    }
-
-    impl<'a> Flash for AtomicHardware<'a> {
+    impl Flash for AtomicHardware {
         fn flash_range(&mut self, start: u32, data: &[u8]) {
-            self.inner.last_flash_start.store(start, Ordering::Release);
-            self.inner
-                .last_flash_len
-                .store(data.len() as u32, Ordering::Release);
+            assert_eq!(self.parameters.valid_flash_range.0, 0);
+            let mut inner = self.inner.lock().unwrap();
+            let su = start as usize;
+            inner
+                .flash
+                .get_mut(su..su + data.len())
+                .unwrap()
+                .copy_from_slice(data)
         }
 
         fn erase_range(&mut self, start: u32, len: u32) {
-            self.inner.last_erase_start.store(start, Ordering::Release);
-            self.inner.last_erase_len.store(len, Ordering::Release);
+            assert_eq!(self.parameters.valid_flash_range.0, 0);
+            let mut inner = self.inner.lock().unwrap();
+            let su = start as usize;
+            let lu = len as usize;
+            inner
+                .flash
+                .get_mut(su..su + lu)
+                .unwrap()
+                .iter_mut()
+                .for_each(|b| *b = 0xFF);
         }
 
         fn write_settings(&mut self, data: &[u8], crc: u32) {
-            self.inner
-                .last_settings_len
-                .store(data.len() as u32, Ordering::Release);
-            self.inner.last_settings_crc32.store(crc, Ordering::Release);
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .settings
+                .get_mut(..data.len())
+                .unwrap()
+                .copy_from_slice(data);
+            inner
+                .settings
+                .get_mut(data.len()..data.len() + 4)
+                .unwrap()
+                .copy_from_slice(&crc.to_le_bytes());
         }
 
-        fn read_range(&mut self, start_addr: u32, len: u32) -> &[u8] {
-            self.inner
-                .last_read_start
-                .store(start_addr, Ordering::Release);
-            self.inner.last_read_len.store(len, Ordering::Release);
-            b"lolololol"
+        fn read_range(&mut self, _start_addr: u32, _len: u32) -> &[u8] {
+            assert_eq!(self.parameters.valid_flash_range.0, 0);
+            todo!("uhhhhh")
         }
 
         fn parameters(&self) -> &Parameters {
             &self.parameters
         }
+    }
+
+    #[test]
+    fn do_a_bootload() {
+        let mut acc_buf = [0u8; 3 * 1024];
+        let hw = AtomicHardware::new(stm32g031_params());
+        let mut machine = Machine::new(&mut acc_buf, hw.clone());
+
+        let seq: &[(Request<'static>, Result<Response<'static>, ResponseError>)] = &[
+            (
+                Request::GetParameters,
+                Ok(Response::Parameters(stm32g031_params())),
+            ),
+            (
+                Request::StartBootload(StartBootload {
+                    start_addr: 16 * 1024,
+                    length: 8 * 1024,
+                    crc32: 0x2765_005a,
+                }),
+                Ok(Response::BootloadStarted),
+            ),
+            (
+                Request::DataChunk(DataChunk {
+                    data_addr: 16 * 1024,
+                    sub_crc32: 0x5b54_dab5,
+                    data: &[16; 2048],
+                }),
+                Ok(Response::ChunkAccepted {
+                    data_addr: 16 * 1024,
+                    data_len: 2048,
+                    crc32: 0x5b54_dab5,
+                }),
+            ),
+            (
+                Request::DataChunk(DataChunk {
+                    data_addr: 18 * 1024,
+                    sub_crc32: 0x8c91_77aa,
+                    data: &[18; 2048],
+                }),
+                Ok(Response::ChunkAccepted {
+                    data_addr: 18 * 1024,
+                    data_len: 2048,
+                    crc32: 0x8c91_77aa,
+                }),
+            ),
+            (
+                Request::DataChunk(DataChunk {
+                    data_addr: 20 * 1024,
+                    sub_crc32: 0xf01e_9d3c,
+                    data: &[20; 2048],
+                }),
+                Ok(Response::ChunkAccepted {
+                    data_addr: 20 * 1024,
+                    data_len: 2048,
+                    crc32: 0xf01e_9d3c,
+                }),
+            ),
+            (
+                Request::DataChunk(DataChunk {
+                    data_addr: 22 * 1024,
+                    sub_crc32: 0x27db_3023,
+                    data: &[22; 2048],
+                }),
+                Ok(Response::ChunkAccepted {
+                    data_addr: 22 * 1024,
+                    data_len: 2048,
+                    crc32: 0x27db_3023,
+                }),
+            ),
+            (
+                Request::CompleteBootload { reboot: true },
+                Ok(Response::ConfirmComplete { will_reboot: true }),
+            ),
+        ];
+
+        for (req, exp_res) in seq {
+            let mut enc_used = req.encode_to_vec();
+
+            enc_used.pop();
+            for b in enc_used {
+                let res = machine.push(b);
+                assert!(matches!(res, None));
+            }
+            let res = machine.push(0x00);
+            let mut res = res.unwrap();
+            let act_res: Result<Response<'_>, ResponseError> = decode_in_place(&mut res).unwrap();
+            assert_eq!(&act_res, exp_res);
+            drop(act_res);
+            drop(res);
+            assert_eq!(machine.acc.idx, 0);
+        }
+
+        {
+            let hwinner = hw.inner.lock().unwrap();
+            let flash = &hwinner.flash;
+
+            // Memory test!
+            assert_eq!(&flash[..16 * 1024], [0xA5; 16 * 1024].as_slice());
+            assert_eq!(&flash[16 * 1024..][.. 2048], [16; 2048].as_slice());
+            assert_eq!(&flash[18 * 1024..][.. 2048], [18; 2048].as_slice());
+            assert_eq!(&flash[20 * 1024..][.. 2048], [20; 2048].as_slice());
+            assert_eq!(&flash[22 * 1024..][.. 2048], [22; 2048].as_slice());
+            assert_eq!(&flash[24 * 1024..][.. (64 - 24) * 1024], [0xA5; (64 - 24) * 1024].as_slice());
+        }
+
+        assert!(matches!(machine.state.mode, Mode::RebootPending));
     }
 }

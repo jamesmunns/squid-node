@@ -1,5 +1,5 @@
 use crc::Digest;
-use postcard::ser_flavors::{Cobs, StdVec, Slice};
+use postcard::ser_flavors::{Cobs, Slice, StdVec};
 use serde::{Deserialize, Serialize};
 
 use crate::CRC;
@@ -168,8 +168,15 @@ impl<'a> Response<'a> {
     }
 }
 
-pub fn encode_resp_to_slice<'a, 'b>(resp: &Result<Response<'a>, ResponseError>, buf: &'b mut [u8]) -> Result<&'b mut [u8], postcard::Error> {
-    postcard::serialize_with_flavor::<Result<Response<'a>, ResponseError>, Crc32SerFlavor<Cobs<Slice<'b>>>, &'b mut [u8]>(
+pub fn encode_resp_to_slice<'a, 'b>(
+    resp: &Result<Response<'a>, ResponseError>,
+    buf: &'b mut [u8],
+) -> Result<&'b mut [u8], postcard::Error> {
+    postcard::serialize_with_flavor::<
+        Result<Response<'a>, ResponseError>,
+        Crc32SerFlavor<Cobs<Slice<'b>>>,
+        &'b mut [u8],
+    >(
         &resp,
         Crc32SerFlavor {
             flav: Cobs::try_new(Slice::new(buf))?,
@@ -179,9 +186,13 @@ pub fn encode_resp_to_slice<'a, 'b>(resp: &Result<Response<'a>, ResponseError>, 
 }
 
 #[inline]
-pub fn decode_in_place<'a, T: Deserialize<'a>>(buf: &'a mut [u8]) -> Result<T, crate::machine::Error> {
+pub fn decode_in_place<'a, T: Deserialize<'a>>(
+    buf: &'a mut [u8],
+) -> Result<T, crate::machine::Error> {
     let used = cobs::decode_in_place(buf).map_err(|_| crate::machine::Error::Cobs)?;
-    let buf = buf.get_mut(..used).ok_or(crate::machine::Error::LogicError)?;
+    let buf = buf
+        .get_mut(..used)
+        .ok_or(crate::machine::Error::LogicError)?;
     if used < 5 {
         return Err(crate::machine::Error::Underfill);
     }
@@ -191,11 +202,13 @@ pub fn decode_in_place<'a, T: Deserialize<'a>>(buf: &'a mut [u8]) -> Result<T, c
     let exp_crc = u32::from_le_bytes(crc_bytes);
     let act_crc = CRC.checksum(data);
     if exp_crc != act_crc {
-        return Err(crate::machine::Error::Crc { expected: exp_crc, actual: act_crc });
+        return Err(crate::machine::Error::Crc {
+            expected: exp_crc,
+            actual: act_crc,
+        });
     }
     postcard::from_bytes(data).map_err(|_| crate::machine::Error::PostcardDecode)
 }
-
 
 struct Crc32SerFlavor<B>
 where

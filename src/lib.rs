@@ -1,6 +1,6 @@
 #![cfg_attr(not(any(test, feature = "use-std")), no_std)]
 
-use crc::{CRC_32_CKSUM, Crc};
+use crc::{Crc, CRC_32_CKSUM};
 
 pub mod icd;
 pub mod machine;
