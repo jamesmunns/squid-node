@@ -11,6 +11,7 @@ use crate::icd::Response;
 use crate::icd::ResponseError;
 use crate::icd::StartBootload;
 use crate::icd::Status;
+use crate::CRC;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -95,34 +96,7 @@ impl<'buf> Accumulator<'buf> {
     fn finish(&mut self) -> Result<Option<Request<'_>>, Error> {
         let data = self.buffer.get_mut(..self.idx).ok_or(Error::LogicError)?;
         self.idx = 0;
-
-        let out_len = cobs::decode_in_place(data).map_err(|_| Error::Cobs)?;
-        let data = data.get_mut(..out_len).ok_or(Error::LogicError)?;
-
-        if out_len < 5 {
-            // We need AT LEAST 4 bytes for CRC, and 1 byte for data.
-            return Err(Error::Underfill);
-        }
-
-        let (data, crc_bytes) = data.split_at(out_len - 4);
-        let mut crc_buf = [0u8; 4];
-        crc_buf.copy_from_slice(crc_bytes);
-        let exp_crc = u32::from_le_bytes(crc_buf);
-
-        let crcr = Crc::<u32>::new(&CRC_32_CKSUM);
-        let act_crc = crcr.checksum(data);
-
-        if act_crc != exp_crc {
-            return Err(Error::Crc {
-                expected: exp_crc,
-                actual: act_crc,
-            });
-        }
-
-        match postcard::from_bytes::<Request<'_>>(data) {
-            Ok(req) => Ok(Some(req)),
-            Err(_) => Err(Error::PostcardDecode),
-        }
+        Ok(Some(crate::icd::decode_in_place(data)?))
     }
 
     pub fn borrow_buf<'me>(&'me mut self) -> BorrowBuf<'me, 'buf> {
@@ -138,8 +112,6 @@ pub trait Flash {
     fn parameters(&self) -> &Parameters;
 }
 
-const CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_CKSUM);
-
 struct BootLoadMeta {
     digest_running: Digest<'static, u32>,
     addr_start: u32,
@@ -154,8 +126,7 @@ enum Mode {
     RebootPending,
 }
 
-fn default_params() -> Parameters {
-    // todo
+fn stm32g031_params() -> Parameters {
     Parameters {
         settings_max: (2 * 1024) - 4,
         data_chunk_size: 2 * 1024,
@@ -184,10 +155,7 @@ impl<'buf, HW: Flash> Machine<'buf, HW> {
             mode: Mode::Idle,
             hardware: hw,
         };
-        Self {
-            acc,
-            state,
-        }
+        Self { acc, state }
     }
 
     pub fn push<'me>(&'me mut self, byte: u8) -> Option<BorrowBuf<'me, 'buf>> {
@@ -328,14 +296,18 @@ impl<HW: Flash> State<HW> {
 
                 if let Some(end) = start_addr.checked_add(len) {
                     if end <= self.hardware.parameters().valid_flash_range.1 {
-                        Ok(Response::ReadRange { start_addr, len, data: &[] })
+                        Ok(Response::ReadRange {
+                            start_addr,
+                            len,
+                            data: &[],
+                        })
                     } else {
                         Err(ResponseError::BadRangeEnd)
                     }
                 } else {
                     Err(ResponseError::BadRangeEnd)
                 }
-            },
+            }
             Request::AbortBootload => {
                 let mode = core::mem::replace(&mut self.mode, Mode::Idle);
                 let response;
@@ -453,7 +425,9 @@ impl<HW: Flash> State<HW> {
         if sb.start_addr != self.hardware.parameters().valid_app_range.0 {
             return (Err(ResponseError::BadStartAddress), Mode::Idle);
         }
-        let too_long = sb.length >= (self.hardware.parameters().valid_app_range.1 - self.hardware.parameters().valid_app_range.0);
+        let too_long = sb.length
+            >= (self.hardware.parameters().valid_app_range.1
+                - self.hardware.parameters().valid_app_range.0);
         let not_full = (sb.length & (self.hardware.parameters().data_chunk_size - 1)) != 0;
         if too_long || not_full {
             return (Err(ResponseError::BadLength), Mode::Idle);
@@ -475,21 +449,39 @@ impl<HW: Flash> State<HW> {
 
     pub fn respond<'a, 'b>(&mut self, mut buf: BorrowBuf<'a, 'b>) -> BorrowBuf<'a, 'b> {
         let msg = self.pending_resp.take().unwrap_or(Err(ResponseError::Oops));
-        let _msg = match msg {
+        let msg = match msg {
             Ok(ok_msg) => Ok(match ok_msg {
                 // These require "re-work"!
-                Response::ReadRange { start_addr, len, data: _  } => {
+                Response::ReadRange {
+                    start_addr,
+                    len,
+                    data: _,
+                } => {
                     let read = self.hardware.read_range(start_addr, len);
-                    Response::ReadRange { start_addr, len, data: read }
-                },
+                    Response::ReadRange {
+                        start_addr,
+                        len,
+                        data: read,
+                    }
+                }
                 Response::Settings { .. } => todo!(),
                 other => other,
             }),
             Err(err_msg) => Err(err_msg),
         };
 
-        // TODO! Encode and stuff
-        buf.shrink_to(0);
+        let dbuf: &mut [u8] = &mut buf;
+        match crate::icd::encode_resp_to_slice(&msg, dbuf) {
+            Ok(used) => {
+                let len = used.len();
+                buf.shrink_to(len);
+            }
+            Err(_) => {
+                // welp.
+                // TODO! Encode and stuff
+                buf.shrink_to(0);
+            }
+        };
         buf
     }
 }
@@ -511,7 +503,14 @@ pub mod feat_test {
 
 #[cfg(all(test, feature = "use-std"))]
 pub mod test {
-    use crate::{icd::Request, machine::Accumulator};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::{
+        icd::{Parameters, Request, Response, ResponseError},
+        machine::{stm32g031_params, Accumulator, Machine},
+    };
+
+    use super::Flash;
 
     #[test]
     fn accumulator_smoke() {
@@ -534,5 +533,102 @@ pub mod test {
         let fin = acc.push(0x00);
         assert_eq!(fin, Ok(Some(msg)));
         assert_eq!(acc.idx, 0);
+    }
+
+    #[test]
+    fn machine_smoke() {
+        let msg = Request::Ping(1234);
+        let mut enc_used = msg.encode_to_vec();
+        assert_eq!(
+            &enc_used,
+            &[0x01, 0x07, 0xD2, 0x09, 0x38, 0xBE, 0x5F, 0xAE, 0x00]
+        );
+        // Pop off the terminator, we'll do that manually
+        enc_used.pop();
+
+        let mut acc_buf = [0u8; 128];
+        let hw_inner = HwInner::default();
+        let hw = AtomicHardware {
+            inner: &hw_inner,
+            parameters: stm32g031_params(),
+        };
+
+        let mut machine = Machine::new(&mut acc_buf, hw);
+
+        for b in enc_used.iter() {
+            let res = machine.push(*b);
+            assert!(matches!(res, None));
+        }
+        let fin = machine.push(0x00);
+        let fin_buf = fin.unwrap();
+        let mut fin_vec = Vec::new();
+        fin_vec.extend_from_slice(&fin_buf);
+        let resp = crate::icd::decode_in_place::<Result<Response<'_>, ResponseError>>(&mut fin_vec)
+            .unwrap();
+        assert_eq!(resp, Ok(Response::Pong(1234)));
+    }
+
+    struct HwInner {
+        last_flash_start: AtomicU32,
+        last_flash_len: AtomicU32,
+        last_erase_start: AtomicU32,
+        last_erase_len: AtomicU32,
+        last_settings_len: AtomicU32,
+        last_settings_crc32: AtomicU32,
+        last_read_start: AtomicU32,
+        last_read_len: AtomicU32,
+    }
+
+    impl Default for HwInner {
+        fn default() -> Self {
+            Self {
+                last_flash_start: AtomicU32::new(0xFFFF_FFFF),
+                last_flash_len: AtomicU32::new(0xFFFF_FFFF),
+                last_erase_start: AtomicU32::new(0xFFFF_FFFF),
+                last_erase_len: AtomicU32::new(0xFFFF_FFFF),
+                last_settings_len: AtomicU32::new(0xFFFF_FFFF),
+                last_settings_crc32: AtomicU32::new(0xFFFF_FFFF),
+                last_read_start: AtomicU32::new(0xFFFF_FFFF),
+                last_read_len: AtomicU32::new(0xFFFF_FFFF),
+            }
+        }
+    }
+
+    struct AtomicHardware<'a> {
+        inner: &'a HwInner,
+        parameters: Parameters,
+    }
+
+    impl<'a> Flash for AtomicHardware<'a> {
+        fn flash_range(&mut self, start: u32, data: &[u8]) {
+            self.inner.last_flash_start.store(start, Ordering::Release);
+            self.inner
+                .last_flash_len
+                .store(data.len() as u32, Ordering::Release);
+        }
+
+        fn erase_range(&mut self, start: u32, len: u32) {
+            self.inner.last_erase_start.store(start, Ordering::Release);
+            self.inner.last_erase_len.store(len, Ordering::Release);
+        }
+
+        fn write_settings(&mut self, data: &[u8], crc: u32) {
+            self.inner
+                .last_settings_len
+                .store(data.len() as u32, Ordering::Release);
+            self.inner.last_settings_crc32.store(crc, Ordering::Release);
+        }
+
+        fn read_range(&mut self, start_addr: u32, len: u32) -> &[u8] {
+            self.inner
+                .last_read_start
+                .store(start_addr, Ordering::Release);
+            self.inner.last_read_len.store(len, Ordering::Release);
+            b"lolololol"
+        }
+
+        fn parameters(&self) -> &Parameters {
+            &self.parameters
+        }
     }
 }

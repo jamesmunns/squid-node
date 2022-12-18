@@ -1,4 +1,8 @@
+use crc::Digest;
+use postcard::ser_flavors::{Cobs, StdVec, Slice};
 use serde::{Deserialize, Serialize};
+
+use crate::CRC;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct DataChunk<'a> {
@@ -131,17 +135,98 @@ impl<'a> Request<'a> {
     /// * cobs encoding
     /// * DOES append `0x00` terminator
     pub fn encode_to_vec(&self) -> Vec<u8> {
-        use crc::{Crc, CRC_32_CKSUM};
+        postcard::serialize_with_flavor::<Self, Crc32SerFlavor<Cobs<StdVec>>, Vec<u8>>(
+            self,
+            Crc32SerFlavor {
+                flav: Cobs::try_new(StdVec::new()).unwrap(),
+                checksum: CRC.digest(),
+            },
+        )
+        .unwrap()
+    }
+}
 
-        let mut used = postcard::to_stdvec(self).unwrap();
+#[cfg(feature = "use-std")]
+impl<'a> Response<'a> {
+    /// Encode a request to a vec.
+    ///
+    /// Does:
+    ///
+    /// * postcard encoding
+    /// * appending crc32 (le)
+    /// * cobs encoding
+    /// * DOES append `0x00` terminator
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        postcard::serialize_with_flavor::<Self, Crc32SerFlavor<Cobs<StdVec>>, Vec<u8>>(
+            self,
+            Crc32SerFlavor {
+                flav: Cobs::try_new(StdVec::new()).unwrap(),
+                checksum: CRC.digest(),
+            },
+        )
+        .unwrap()
+    }
+}
 
-        let crcr = Crc::<u32>::new(&CRC_32_CKSUM);
-        let act_crc = crcr.checksum(&used);
-        used.extend_from_slice(&act_crc.to_le_bytes());
-        let mut enc_used = cobs::encode_vec(&used);
-        // Terminator
-        enc_used.push(0x00);
+pub fn encode_resp_to_slice<'a, 'b>(resp: &Result<Response<'a>, ResponseError>, buf: &'b mut [u8]) -> Result<&'b mut [u8], postcard::Error> {
+    postcard::serialize_with_flavor::<Result<Response<'a>, ResponseError>, Crc32SerFlavor<Cobs<Slice<'b>>>, &'b mut [u8]>(
+        &resp,
+        Crc32SerFlavor {
+            flav: Cobs::try_new(Slice::new(buf))?,
+            checksum: CRC.digest(),
+        },
+    )
+}
 
-        enc_used
+#[inline]
+pub fn decode_in_place<'a, T: Deserialize<'a>>(buf: &'a mut [u8]) -> Result<T, crate::machine::Error> {
+    let used = cobs::decode_in_place(buf).map_err(|_| crate::machine::Error::Cobs)?;
+    let buf = buf.get_mut(..used).ok_or(crate::machine::Error::LogicError)?;
+    if used < 5 {
+        return Err(crate::machine::Error::Underfill);
+    }
+    let (data, crc) = buf.split_at_mut(used - 4);
+    let mut crc_bytes = [0u8; 4];
+    crc_bytes.copy_from_slice(crc);
+    let exp_crc = u32::from_le_bytes(crc_bytes);
+    let act_crc = CRC.checksum(data);
+    if exp_crc != act_crc {
+        return Err(crate::machine::Error::Crc { expected: exp_crc, actual: act_crc });
+    }
+    postcard::from_bytes(data).map_err(|_| crate::machine::Error::PostcardDecode)
+}
+
+
+struct Crc32SerFlavor<B>
+where
+    B: postcard::ser_flavors::Flavor,
+{
+    flav: B,
+    checksum: Digest<'static, u32>,
+}
+
+impl<B> postcard::ser_flavors::Flavor for Crc32SerFlavor<B>
+where
+    B: postcard::ser_flavors::Flavor,
+{
+    type Output = <B as postcard::ser_flavors::Flavor>::Output;
+
+    #[inline]
+    fn try_push(&mut self, data: u8) -> postcard::Result<()> {
+        self.checksum.update(&[data]);
+        self.flav.try_push(data)
+    }
+
+    #[inline]
+    fn finalize(mut self) -> postcard::Result<Self::Output> {
+        let calc_crc = self.checksum.finalize();
+        self.flav.try_extend(&calc_crc.to_le_bytes())?;
+        self.flav.finalize()
+    }
+
+    #[inline]
+    fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
+        self.checksum.update(data);
+        self.flav.try_extend(data)
     }
 }
